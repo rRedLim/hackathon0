@@ -19,7 +19,8 @@ interface HourItem {
 const REINFORCE_METHOD =
   'Единица — вагон-час: прогноз посадок маршрута за час делится на плановый выпуск (число вагонов на линии в этот час по истории). ' +
   'Норма маршрута — 90-й перцентиль посадок на вагон-час в истории. Час становится кандидатом на усиление, если прогнозная нагрузка ' +
-  'выше нормы; добавка = ⌈прогноз / норма⌉ − выпуск (не больше максимального парка маршрута).'
+  'выше нормы; добавка = ⌈прогноз / норма⌉ − выпуск. Реализуемость проверяется дважды: по парку маршрута (максимум выходов ' +
+  'на линии за час в истории) и по парку сети (сумма выпуска всех маршрутов в час не больше исторического максимума сети).'
 
 const RESERVE_METHOD =
   'Резерв (экономия) — часы 7:00–22:59, где прогноз посадок на вагон ниже 50 % нормы маршрута. Оставляем ' +
@@ -48,18 +49,23 @@ export default function FleetPage() {
   const data = routes.length ? res.data : undefined
   const colorOf = (r: number) => meta.routes.find((x) => x.route === r)?.color ?? '#607d8b'
   const isReserve = mode === 'reserve'
-  const days = daysBetween(from, to)
+  const days = data?.period?.days ?? daysBetween(from, to)
+  // плановый выпуск и часы работы известны только за весь горизонт: за неполный период доли не считаются
+  const fullPeriod = data?.period?.full ?? (from === minD && to === maxD)
 
   const totals = useMemo(() => {
     const s = data?.summary ?? []
     const sum = (f: (r: (typeof s)[number]) => number | undefined) => s.reduce((a, r) => a + (f(r) ?? 0), 0)
     return {
       extra: sum((r) => r.extraVehicleHours),
+      feasible: sum((r) => r.feasibleVehicleHours ?? r.extraVehicleHours),
+      network: sum((r) => r.networkVehicleHours ?? r.feasibleVehicleHours ?? r.extraVehicleHours),
+      networkFleetMax: s[0]?.networkFleetMax,
       cand: sum((r) => r.candHours),
-      service: sum((r) => r.serviceHours),
+      service: sum((r) => r.serviceHours ?? undefined),
       reserve: sum((r) => r.reserveVehicleHours),
       reserveHours: sum((r) => r.reserveHours),
-      planned: sum((r) => r.plannedVehicleHours),
+      planned: sum((r) => r.plannedVehicleHours ?? undefined),
       topExtra: [...s].sort((a, b) => b.extraVehicleHours - a.extraVehicleHours)[0],
       topReserve: [...s].sort((a, b) => (b.reserveVehicleHours ?? 0) - (a.reserveVehicleHours ?? 0))[0],
     }
@@ -129,7 +135,8 @@ export default function FleetPage() {
   ]
   const candCols: Column<FleetCandidate>[] = [
     ...baseCols<FleetCandidate>(),
-    { key: 'e', title: 'Добавить вагонов', num: true, render: (c) => <b>+{fmtNum(c.extra)}</b> },
+    { key: 'e', title: 'Нужно добавить', num: true, render: (c) => <b>+{fmtNum(c.extra)}</b> },
+    { key: 'en', title: 'В пределах парка сети', num: true, render: (c) => (c.extraNetwork === undefined ? '—' : `+${fmtNum(c.extraNetwork)}`) },
   ]
   const reserveCols: Column<FleetReserve>[] = [
     ...baseCols<FleetReserve>(),
@@ -194,7 +201,7 @@ export default function FleetPage() {
                 </span>
                 <span className="muted small">
                   {balance <= 0
-                    ? 'резерва в тихие часы хватает, чтобы покрыть усиление в пики без роста общего выпуска'
+                    ? 'резерва в тихие часы по вагоно-часам хватает, чтобы покрыть потребность в усилении в пики; это потребность, а не план — парк депо в данных не виден'
                     : 'усиление в пики больше, чем высвобождается в тихие часы'}
                 </span>
               </div>
@@ -205,8 +212,12 @@ export default function FleetPage() {
                   <Kpi label="В среднем за день" value={`−${fmtNum(totals.reserve / Math.max(1, days), 1)}`} sub={`${days} дн.`} accent="#2f6fb0" />
                   <Kpi
                     label="Доля от планового выпуска"
-                    value={totals.planned ? fmtShare(totals.reserve / totals.planned) : '—'}
-                    sub={totals.planned ? `плановый выпуск ${fmtNum(totals.planned)} ваг.-ч` : undefined}
+                    value={fullPeriod && totals.planned ? fmtShare(totals.reserve / totals.planned) : '—'}
+                    sub={
+                      fullPeriod && totals.planned
+                        ? `плановый выпуск ${fmtNum(totals.planned)} ваг.-ч`
+                        : 'считается только за весь период 01.11–31.12'
+                    }
                   />
                   {totals.topReserve && (totals.topReserve.reserveVehicleHours ?? 0) > 0 && (
                     <Kpi
@@ -218,8 +229,17 @@ export default function FleetPage() {
                 </div>
               ) : (
                 <div className="kpi-row">
-                  <Kpi label="Доп. вагоно-часов" value={`+${fmtNum(totals.extra)}`} sub={`${fmtDate(from)} — ${fmtDate(to)}`} accent="#c0392b" />
-                  <Kpi label="Часов-кандидатов" value={fmtNum(totals.cand)} sub={`из ${fmtNum(totals.service)} часов работы (${fmtShare(totals.service ? totals.cand / totals.service : 0)})`} />
+                  <Kpi label="Нужно доп. вагоно-часов" value={`+${fmtNum(totals.extra)}`} sub={`${fmtDate(from)} — ${fmtDate(to)}, в среднем ${fmtNum(totals.extra / Math.max(1, days), 1)} в день`} accent="#c0392b" />
+                  <Kpi
+                    label="В пределах парка сети"
+                    value={`+${fmtNum(totals.network)}`}
+                    sub={`в пределах парка маршрутов +${fmtNum(totals.feasible)}${totals.networkFleetMax ? `; сеть выпускала одновременно не больше ${fmtNum(totals.networkFleetMax)} вагонов` : ''}`}
+                  />
+                  <Kpi
+                    label="Часов-кандидатов"
+                    value={fmtNum(totals.cand)}
+                    sub={fullPeriod && totals.service ? `из ${fmtNum(totals.service)} часов работы (${fmtShare(totals.cand / totals.service)})` : `${days} дн.; доля от часов работы — только за весь период`}
+                  />
                   {totals.topExtra && (
                     <Kpi
                       label="Больше всего нужно"
@@ -234,7 +254,7 @@ export default function FleetPage() {
                 <div className="hint">Сервер не вернул расчёт резерва (поле reserve) — обновите backend.</div>
               )}
 
-              <Section title="Сводка по маршрутам">
+              <Section title={`Сводка по маршрутам за ${fmtDate(from)} — ${fmtDate(to)}`}>
                 <div className="table-wrap">
                   {isReserve ? (
                     <table className="table">
@@ -288,13 +308,18 @@ export default function FleetPage() {
                         <tr>
                           <th>Маршрут</th>
                           <th className="num">Норма, посадок/ваг.-ч</th>
-                          <th className="num">Макс. выпуск</th>
+                          <th className="num" title="Максимум выходов (графиков) маршрута на линии за час в истории">
+                            Парк маршрута, выходов
+                          </th>
                           <th className="num">Часов работы</th>
                           <th className="num">Часов-кандидатов</th>
                           <th className="num">Доля</th>
-                          <th className="num">Доп. вагоно-часов</th>
-                          <th className="num" title="С учётом максимального парка маршрута">
-                            Из них реализуемо
+                          <th className="num">Нужно, ваг.-ч</th>
+                          <th className="num" title="Добавка не больше, чем маршрут уже выпускал одновременно">
+                            В пределах парка маршрута
+                          </th>
+                          <th className="num" title="Сумма выпуска всех маршрутов в час не больше исторического максимума сети; излишек срезан с наименее перегруженных маршрутов">
+                            В пределах парка сети
                           </th>
                           <th>Пиковые часы</th>
                         </tr>
@@ -311,7 +336,7 @@ export default function FleetPage() {
                             <td className="num">{fmtNum(s.candHours)}</td>
                             <td className="num">
                               <span className="share-bar">
-                                <i style={{ width: `${Math.min(100, s.candShare * 100)}%`, background: colorOf(s.route) }} />
+                                <i style={{ width: `${Math.min(100, (s.candShare ?? 0) * 100)}%`, background: colorOf(s.route) }} />
                               </span>
                               {fmtShare(s.candShare)}
                             </td>
@@ -319,6 +344,7 @@ export default function FleetPage() {
                               <b>{fmtNum(s.extraVehicleHours)}</b>
                             </td>
                             <td className="num">{fmtNum(s.feasibleVehicleHours ?? s.extraVehicleHours)}</td>
+                            <td className="num">{fmtNum(s.networkVehicleHours)}</td>
                             <td>{s.topHours || '—'}</td>
                           </tr>
                         ))}

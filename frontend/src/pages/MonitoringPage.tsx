@@ -1,8 +1,8 @@
 import { useMemo, useRef, useState } from 'react'
 import { Bar, CartesianGrid, ComposedChart, Legend, Line, ReferenceArea, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 import { API, apiRequest, errorMessage, qs, type IngestResult, type MonitoringResponse, type SimulateResult } from '../api'
-import { Kpi, RouteBadge, Section, Spinner, StateBox } from '../components'
-import { fmtDate, fmtNum, fmtScore, hourLabel } from '../format'
+import { Kpi, RouteBadge, Section, Spinner, StateBox, AlertTarget } from '../components'
+import { fmtDate, fmtNum, fmtScore, hourLabel, alertKindLabel } from '../format'
 import { notify, useApi, useMeta } from '../hooks'
 
 const SAMPLE = `tran_no;device_no;tran_date_time;begin_date_time;input_date_time;crd_hashcode;validation_result;tran_type_id;place_id;good_type;pass_route;ngpt_route;bus_exit_no;garage_number
@@ -208,15 +208,23 @@ export default function MonitoringPage() {
                   </div>
                   {!hasIngest ? (
                     <div className="muted small">Алерты появятся после приёма данных за дату (загрузите CSV или запустите симуляцию справа).</div>
+                  ) : alerts.length === 0 && !(data.hoursCovered?.length) ? (
+                    <div className="hint">
+                      Недостаточно данных для оценки: нет ни одного «принятого» часа — факт по сети везде ниже половины прогноза
+                      (поток ещё идёт или загружена часть маршрутов). Детектор ничего не утверждает о режиме работы.
+                    </div>
                   ) : alerts.length === 0 ? (
-                    <div className="alert-ok">Отклонений от прогноза выше {threshold} % дольше {minHours} ч не обнаружено — режим работы штатный.</div>
+                    <div className="alert-ok">
+                      Отклонений от прогноза выше {threshold} % дольше {minHours} ч не обнаружено за оценённые часы
+                      ({data.hoursCovered?.length ?? 0} ч) — режим работы штатный.
+                    </div>
                   ) : (
                     <ul className="alerts">
                       {alerts.map((a, i) => (
-                        <li key={i} className={`alert alert-${a.kind === 'drop' ? 'drop' : 'surge'}`}>
+                        <li key={i} className={`alert alert-${a.kind === 'surge' ? 'surge' : 'drop'}`}>
                           <div className="alert-top">
-                            <RouteBadge route={a.route} color={colorOf(a.route)} />
-                            <span className="alert-kind">{a.kind === 'drop' ? '▼ провал' : '▲ всплеск'}</span>
+                            <AlertTarget route={a.route} color={colorOf(a.route)} />
+                            <span className="alert-kind">{alertKindLabel(a.kind)}</span>
                             <span className="alert-hours">
                               {hourLabel(a.fromHour)}–{hourLabel((a.toHour + 1) % 24)} · {a.hours} ч
                             </span>
@@ -310,7 +318,8 @@ export default function MonitoringPage() {
         <Section title="Симуляция потока для демонстрации детектора">
           <div className="muted small">
             Сервер генерирует поток валидаций из прогноза (с шумом) и внедряет аномалию на выбранном маршруте — так можно показать работу
-            детектора без реального потока. Это <b>симуляция</b>, не фактические данные.
+            детектора без реального потока. Это <b>симуляция</b>, не фактические данные. Повторный запуск заменяет данные этой даты,
+            а не прибавляется к ним. Принятые данные видны только в этой вкладке браузера.
           </div>
           <div className="row">
             <label className="field">
@@ -381,7 +390,8 @@ export default function MonitoringPage() {
         <Section title="Приём потоковых данных (валидации)">
           <div className="muted small">
             CSV в формате train.csv / test.csv: разделитель «;», заголовок, нужны колонки <code>tran_date_time</code>,{' '}
-            <code>validation_result</code>, <code>ngpt_route</code>. Посадка — <code>validation_result = 1</code>.
+            <code>validation_result</code>, <code>ngpt_route</code>. Посадка — <code>validation_result = 1</code>. Поток
+            дописывается к уже принятому: повторная загрузка того же файла удвоит факт — перед повтором нажмите «Сбросить».
           </div>
           <div className="row">
             <input

@@ -160,3 +160,164 @@ def test_real_sample_schedule():
     assert len(tr.stop_ids) == 15 and tr.dep[0] == 6 * 60 + 53 and tr.dep[-1] == 7 * 60 + 11
     r = sb.bind(sb.normalize(raw([("2025-10-31 07:00:30", 1, "1 трамвай", 206)])), trips)
     assert r["stop_name"].iloc[0] == "Чертаново Центральное"
+
+
+# ---------------------------------------------------------------- составной ключ рейса, тип дня, ambiguous
+def trip_rows(times, stop0, route=7, grafic=301, **extra):
+    """Строки одного рейса: остановки stop0+1… с отправлениями times; extra — trip_id, trip_num, service_id…"""
+    return [dict(route_short_name=route, grafic=grafic, stop_sequence=i, stop_id=stop0 + i, stop_name=f"N{stop0 + i}",
+                 departure_time=t, **{"direction_id": 0, **extra}) for i, t in enumerate(times, 1)]
+
+
+def make_trips(tmp_path, rows, stats=None):
+    p = tmp_path / "sched.csv"
+    pd.DataFrame(rows).to_csv(p, index=False)
+    return sb.build_trips(sb.load_schedule(p), stats)
+
+
+MORNING = ["10:00", "10:05", "10:10", "10:15", "10:20"]
+NOON = ["12:00", "12:05", "12:10", "12:15", "12:20"]
+
+
+def test_repeated_trip_id_distinct_trip_num(tmp_path):
+    # формат организаторов: trip_id — шаблон рейса, повторяется; рейсы различает trip_num (строки вперемешку)
+    rows = trip_rows(NOON, 100, trip_id=2040920, trip_num=2, shift_num=1, service_id=3172953) \
+        + trip_rows(MORNING, 100, trip_id=2040920, trip_num=1, shift_num=1, service_id=3172953)
+    stats = {}
+    trips = make_trips(tmp_path, rows[::-1], stats)
+    a, b = trips[(7, "301")]
+    assert (a.trip_id, a.trip_num, b.trip_num) == ("2040920", "1", "2")
+    assert a.dep.tolist() == [600, 605, 610, 615, 620] and b.dep.tolist() == [720, 725, 730, 735, 740]
+    assert stats["trips"] == 2 and stats["trips_non_monotonic"] == 0
+    assert stats["trip_key_columns"] == ["route", "grafic", "service_id", "trip_id", "trip_num", "shift_num"]
+    r = run(trips, [("2025-10-31 10:10:00", 1, "7 трамвай", 301), ("2025-10-31 12:07:30", 1, "7 трамвай", 301),
+                    ("2025-10-31 11:00:00", 1, "7 трамвай", 301)])
+    assert r["status"].tolist() == ["bound", "bound", "outside_trips"]
+    assert r["stop_id"].tolist()[:2] == ["103", "102"] and r["trip_num"].tolist()[:2] == ["1", "2"]
+
+
+def test_repeated_trip_id_without_trip_num_is_split(tmp_path):
+    # нет trip_num, trip_id повторён: рейсы разделяются по сбросу stop_sequence, а не склеиваются в один
+    stats = {}
+    trips = make_trips(tmp_path, trip_rows(MORNING, 100, trip_id="T") + trip_rows(NOON, 100, trip_id="T"), stats)
+    assert [t.dep[0] for t in trips[(7, "301")]] == [600, 720]
+    assert stats["template_groups_split"] == 1 and stats["trips_from_split"] == 2
+    r = run(trips, [("2025-10-31 12:10:00", 1, "7 трамвай", 301)])
+    assert r["stop_id"].tolist() == ["103"]
+
+
+def test_non_monotonic_trip_excluded(tmp_path):
+    stats = {}
+    rows = trip_rows(["10:00", "10:05", "09:50", "10:15"], 100, trip_id="BAD") + trip_rows(NOON, 200, trip_id="OK")
+    trips = make_trips(tmp_path, rows, stats)
+    assert [t.trip_id for t in trips[(7, "301")]] == ["OK"]
+    assert stats["trips_non_monotonic"] == 1 and stats["non_monotonic_examples"] == ["7/301//BAD//"]
+    r = run(trips, [("2025-10-31 10:05:00", 1, "7 трамвай", 301)])
+    assert r["status"].tolist() == ["outside_trips"]  # не привязываем по сломанному рейсу
+
+
+@pytest.mark.parametrize("times, expected", [
+    ([600, 605, 610], [600, 605, 610]),
+    ([1430, 1435, 0, 5], [1430, 1435, 1440, 1445]),     # один переход через полночь
+    ([1440, 1445, 1450], [1440, 1445, 1450]),           # 24:00+ уже монотонно
+    ([600, 605, 590], None),                            # убывание меньше 12 ч — ошибка, а не полночь
+    ([1430, 5, 1420, 10], None),                        # второй «переход»
+])
+def test_unwrap_midnight(times, expected):
+    got = sb.unwrap_midnight(times)
+    assert (got is None and expected is None) or got.tolist() == expected
+
+
+WEEKDAY_ID, WEEKEND_ID = 3172953, 3172954
+
+
+def overlap_rows(wd=WEEKDAY_ID, we=WEEKEND_ID):
+    """График 301: будний рейс 10:00…10:20 (остановки 101…) и выходной 10:02…10:22 (остановки 201…)."""
+    return trip_rows(MORNING, 100, trip_id="A", trip_num=1, service_id=wd) \
+        + trip_rows(["10:02", "10:07", "10:12", "10:17", "10:22"], 200, trip_id="B", trip_num=1, service_id=we,
+                    direction_id=1)
+
+
+def write_calendar(tmp_path, rows):
+    p = tmp_path / "calendar.csv"
+    pd.DataFrame(rows, columns=["service_id", *sb.WEEKDAYS, "start_date", "end_date"]).to_csv(p, index=False)
+    return p
+
+
+FRI, SAT = "2025-10-31 10:05:00", "2025-11-01 10:05:00"
+
+
+def test_service_id_resolved_by_calendar(tmp_path):
+    trips = make_trips(tmp_path, overlap_rows())
+    cal = sb.load_calendar(write_calendar(tmp_path, [(WEEKDAY_ID, 1, 1, 1, 1, 1, 0, 0, "", ""),
+                                                     (WEEKEND_ID, 0, 0, 0, 0, 0, 1, 1, "", "")]))
+    r = sb.bind(sb.normalize(raw([(FRI, 1, "7 трамвай", 301), (SAT, 1, "7 трамвай", 301)])), trips, calendar=cal)
+    assert r["status"].tolist() == ["bound", "bound"]
+    assert r["stop_id"].tolist() == ["102", "201"] and r["service_id"].tolist() == ["3172953", "3172954"]
+    assert sb.service_mapping(trips, cal)["3172954"]["days"] == ["saturday", "sunday"]
+
+
+def test_calendar_date_range(tmp_path):
+    trips = make_trips(tmp_path, overlap_rows())
+    cal = sb.load_calendar(write_calendar(tmp_path, [(WEEKDAY_ID, 1, 1, 1, 1, 1, 1, 1, "20251101", "20251231"),
+                                                     (WEEKEND_ID, 1, 1, 1, 1, 1, 1, 1, "20251001", "20251031")]))
+    r = sb.bind(sb.normalize(raw([(FRI, 1, "7 трамвай", 301), (SAT, 1, "7 трамвай", 301)])), trips, calendar=cal)
+    assert r["stop_id"].tolist() == ["201", "102"]
+
+
+def test_service_id_heuristic_without_calendar(tmp_path):
+    trips = make_trips(tmp_path, overlap_rows("Будни", "Выходные"))
+    r = run(trips, [(FRI, 1, "7 трамвай", 301), (SAT, 1, "7 трамвай", 301)])
+    assert r["stop_id"].tolist() == ["102", "201"]
+    assert sb.service_mapping(trips)["Будни"]["source"] == "heuristic"
+
+
+@pytest.mark.parametrize("sid, days", [
+    ("weekday", {0, 1, 2, 3, 4}), ("Рабочие дни", {0, 1, 2, 3, 4}), ("нерабочие", {5, 6}),
+    ("WEEKEND_2025", {5, 6}), ("sat_sun", {5, 6}), ("Суббота", {5}), ("вс", {6}), ("daily", set(range(7))),
+    ("3172953", None), ("всегда", None), ("sunset", None),
+])
+def test_service_days_heuristic(sid, days):
+    got = sb.service_days(sid)
+    assert (got is None and days is None) or set(got) == days
+
+
+def test_ambiguous_when_service_unresolvable(tmp_path):
+    trips = make_trips(tmp_path, overlap_rows())  # числовые service_id без календаря — действуют во все дни
+    r = run(trips, [(FRI, 1, "7 трамвай", 301), ("2025-10-31 09:59:00", 1, "7 трамвай", 301)])
+    assert r["status"].tolist() == ["ambiguous", "bound"]  # 09:59 — вне обоих рейсов, ближайший — будний
+    assert pd.isna(r["stop_id"].iloc[0]) and pd.isna(r["vehicle_check"].iloc[0])
+    rep = sb.report(r, rows_total=2, not_boarding=0, params={})
+    assert rep["by_status"]["ambiguous"] == 1 and rep["by_route"]["7"]["ambiguous"] == 1
+    w, cover = sb.stop_shares(r, pd.DataFrame(dict(route=7, stop_id=["101"])), min_bound=1, min_stop_share=0)
+    assert cover["7"]["bound"] == 1  # ambiguous в доли остановок не идёт
+
+
+def test_same_stop_or_handover_is_not_ambiguous(tmp_path):
+    # рейс A кончается в 10:20 на конечной, рейс B того же графика стартует в 10:20: посадка — на рейс B
+    rows = trip_rows(MORNING, 100, trip_id="A") + trip_rows(["10:20", "10:25", "10:30"], 200, trip_id="B")
+    r = run(make_trips(tmp_path, rows), [("2025-10-31 10:20:00", 1, "7 трамвай", 301)])
+    assert r["status"].tolist() == ["bound"] and r["stop_id"].tolist() == ["201"]
+
+
+def test_service_after_midnight_uses_previous_day(tmp_path):
+    # будний рейс 23:50…00:10: посадка в сб 00:05 — рейс пятницы, в вс 00:05 — рейс субботы, его нет
+    trips = make_trips(tmp_path, trip_rows(["23:50", "23:55", "00:00", "00:05", "00:10"], 100,
+                                           trip_id="N", service_id="weekday"))
+    r = run(trips, [("2025-11-01 00:05:00", 1, "7 трамвай", 301), ("2025-11-02 00:05:00", 1, "7 трамвай", 301)])
+    assert r["status"].tolist() == ["bound", "outside_trips"] and r["stop_id"].iloc[0] == "104"
+
+
+def test_cli_calendar_and_report(tmp_path):
+    s = tmp_path / "s.csv"
+    pd.DataFrame(overlap_rows()).to_csv(s, index=False)
+    cal = write_calendar(tmp_path, [(WEEKDAY_ID, 1, 1, 1, 1, 1, 0, 0, "", ""), (WEEKEND_ID, 0, 0, 0, 0, 0, 1, 1, "", "")])
+    v = tmp_path / "v.csv"
+    raw([(FRI, 1, "7 трамвай", 301), (SAT, 1, "7 трамвай", 301)]).to_csv(v, sep=";", index=False)
+    base = ["--validations", str(v), "--schedule", str(s), "--stops-ref", str(s)]
+    rep = sb.main(base + ["--calendar", str(cal)])
+    assert rep["by_status"]["bound"] == 2 and rep["by_status"]["ambiguous"] == 0
+    assert rep["params"]["calendar"] == "calendar.csv" and rep["service_mapping"]["3172953"]["source"] == "calendar"
+    assert rep["schedule_checks"]["trips"] == 2
+    rep = sb.main(base)  # без календаря числовые service_id не различить — ambiguous, а не первый попавшийся
+    assert rep["by_status"]["ambiguous"] == 2 and rep["service_mapping"]["3172953"]["source"] == "all_days"

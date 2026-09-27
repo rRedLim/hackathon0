@@ -5,12 +5,25 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { Area, AreaChart, Bar, BarChart, Cell, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 import { API, apiRequest, errorMessage, isAbort, qs, type FleetResponse, type MapLiveResponse, type MapResponse, type MapStop } from '../api'
-import { RouteBadge, RouteChips, Spinner } from '../components'
-import { clampDate, fmtDate, fmtNum, hourLabel } from '../format'
+import { RouteBadge, RouteChips, Spinner, AlertTarget } from '../components'
+import { clampDate, fmtDate, fmtNum, hourLabel, alertKindLabel } from '../format'
 import { useApi, useMeta } from '../hooks'
 
 const MIN_DATE = '2025-01-01'
 const MAX_DATE = '2026-12-31'
+
+const NO_WEBGL2 = 'Карта недоступна: браузер не поддерживает WebGL2 (включите аппаратное ускорение). Остальные вкладки работают.'
+
+/** MapLibre требует WebGL2; без него конструктор карты бросает исключение. */
+function hasWebGL2(): boolean {
+  try {
+    const gl = document.createElement('canvas').getContext('webgl2')
+    gl?.getExtension('WEBGL_lose_context')?.loseContext()
+    return !!gl
+  } catch {
+    return false
+  }
+}
 
 // MapLibre 6 грузит web-worker относительно своего модуля — при сборке Vite указываем URL явно.
 setWorkerUrl(maplibreWorkerUrl)
@@ -116,6 +129,7 @@ export default function MapPage() {
   const [hoverKey, setHoverKey] = useState<string | null>(null)
   const [pinnedKey, setPinnedKey] = useState<string | null>(null)
   const [ready, setReady] = useState(false)
+  const [mapError, setMapError] = useState<string | null>(() => (hasWebGL2() ? null : NO_WEBGL2))
   const [basemap, setBasemap] = useState<Basemap>('osm')
   const [showFleet, setShowFleet] = useState(true)
   const markersRef = useRef<Marker[]>([])
@@ -146,14 +160,22 @@ export default function MapPage() {
 
   // --- инициализация карты
   useEffect(() => {
-    if (!containerRef.current) return
-    const map = new MapLibre({
-      container: containerRef.current,
-      style: STYLE,
-      center: [37.62, 55.75],
-      zoom: 10.5,
-      attributionControl: { compact: true },
-    })
+    if (!containerRef.current || mapError) return
+    let map: MapLibre
+    try {
+      map = new MapLibre({
+        container: containerRef.current,
+        style: STYLE,
+        center: [37.62, 55.75],
+        zoom: 10.5,
+        attributionControl: { compact: true },
+      })
+    } catch (e) {
+      // сбой внешней системы (WebGL) при создании карты — показываем заглушку вместо карты
+      // oxlint-disable-next-line react/set-state-in-effect
+      setMapError(`Карта недоступна: ${errorMessage(e)}. Остальные вкладки работают.`)
+      return
+    }
     mapRef.current = map
     map.addControl(new NavigationControl({ showCompass: false }), 'top-left')
     map.on('load', () => {
@@ -249,7 +271,7 @@ export default function MapPage() {
       map.remove()
       mapRef.current = null
     }
-  }, [])
+  }, [mapError])
 
   // --- линии маршрутов (меняются только с данными)
   useEffect(() => {
@@ -576,7 +598,7 @@ export default function MapPage() {
               </button>
             ))}
           </div>
-          {!routes.length && <div className="map-hint">Выберите хотя бы один маршрут</div>}
+          {!routes.length && !mapError && <div className="map-hint">Выберите хотя бы один маршрут</div>}
           {liveMode && liveData?.available && (
             <div className="live-badge">
               <span className="live-dot" /> LIVE · обновлено {live?.at.toLocaleTimeString('ru-RU')} · данные до {liveLast !== null ? `${String(liveLast + 1).padStart(2, '0')}:00` : '—'}
@@ -599,6 +621,7 @@ export default function MapPage() {
             </div>
           )}
           {liveMode && liveError && <div className="map-hint state-error">Поток недоступен: {liveError}</div>}
+          {mapError && <div className="map-hint state-error">{mapError}</div>}
           <div className="map-legend">
             <div className="legend-title">
               {liveMode ? 'Факт посадок' : 'Посадки'} на остановке в {hourLabel(hour)}
@@ -693,10 +716,10 @@ export default function MapPage() {
               {liveAlerts.length > 0 && (
                 <ul className="alerts">
                   {liveAlerts.map((a, i) => (
-                    <li key={i} className={`alert alert-${a.kind === 'drop' ? 'drop' : 'surge'}`}>
+                    <li key={i} className={`alert alert-${a.kind === 'surge' ? 'surge' : 'drop'}`}>
                       <div className="alert-top">
-                        <RouteBadge route={a.route} color={colorOf(a.route)} />
-                        <span className="alert-kind">{a.kind === 'drop' ? '▼ провал' : '▲ всплеск'}</span>
+                        <AlertTarget route={a.route} color={colorOf(a.route)} />
+                        <span className="alert-kind">{alertKindLabel(a.kind)}</span>
                         <span className="alert-hours">
                           {hourLabel(a.fromHour)}–{hourLabel((a.toHour + 1) % 24)}
                         </span>

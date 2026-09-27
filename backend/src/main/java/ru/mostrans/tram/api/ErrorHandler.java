@@ -74,6 +74,7 @@ public class ErrorHandler {
             case PAYLOAD_TOO_LARGE -> "Слишком большой объём";
             case UNSUPPORTED_MEDIA_TYPE -> "Неподдерживаемый формат";
             case METHOD_NOT_ALLOWED -> "Метод не поддерживается";
+            case SERVICE_UNAVAILABLE -> "Сервис занят";
             default -> st.is5xxServerError() ? "Внутренняя ошибка" : st.getReasonPhrase();
         });
         pd.setInstance(java.net.URI.create(ex.getRequest().getPath().value()));

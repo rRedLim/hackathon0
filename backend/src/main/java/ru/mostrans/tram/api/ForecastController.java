@@ -7,10 +7,16 @@ import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.springframework.core.io.buffer.DataBuffer;
 import org.springframework.core.io.buffer.DataBufferFactory;
+import org.springframework.core.io.buffer.DataBufferUtils;
 import org.springframework.core.io.buffer.DefaultDataBufferFactory;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ContentDisposition;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
@@ -54,6 +60,8 @@ public class ForecastController {
     private static final MediaType XLSX =
             MediaType.parseMediaType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
     private static final MediaType CSV = MediaType.parseMediaType("text/csv;charset=UTF-8");
+    /** Одновременных XLSX-выгрузок: каждая пишется потоком в ответ, но держит поток и буфер строк листа. */
+    static final int XLSX_PARALLEL = 2;
 
     private final DataStore data;
     private final ForecastEngine engine;
@@ -61,6 +69,12 @@ public class ForecastController {
     private final ExportService export;
     private final ObjectMapper json;
     private final ResponseCache mapCache = new ResponseCache(512);
+    private final Semaphore xlsxSlots = new Semaphore(XLSX_PARALLEL);
+    private final ExecutorService xlsxPool = Executors.newFixedThreadPool(XLSX_PARALLEL, r -> {
+        Thread t = new Thread(r, "xlsx-export");
+        t.setDaemon(true);
+        return t;
+    });
 
     public ForecastController(DataStore data, ForecastEngine engine, MapService map, ExportService export,
                               ObjectMapper json) {
@@ -234,14 +248,21 @@ public class ForecastController {
             return Mono.just(ResponseEntity.ok().headers(h).body(csv(e, f)));
         }
         h.setContentType(XLSX);
-        return Mono.fromCallable(() -> {
-                    java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream(1 << 16);
-                    export.writeXlsx(e, q, bos);
-                    return bos.toByteArray();
-                })
-                .subscribeOn(Schedulers.boundedElastic())
-                .map(bytes -> ResponseEntity.ok().headers(h).contentLength(bytes.length)
-                        .body(Flux.just(f.wrap(bytes))));
+        // XLSX пишется потоком прямо в ответ (без сборки файла в памяти), одновременно — не больше XLSX_PARALLEL
+        if (!xlsxSlots.tryAcquire()) {
+            throw new ApiException(HttpStatus.SERVICE_UNAVAILABLE, "format", "Сейчас формируются другие XLSX-выгрузки "
+                    + "(одновременно не больше " + XLSX_PARALLEL + "). Повторите через несколько секунд или выгрузите "
+                    + "CSV — он отдаётся потоком без ограничения");
+        }
+        AtomicBoolean released = new AtomicBoolean();
+        Flux<DataBuffer> body = Flux.from(DataBufferUtils.outputStreamPublisher(
+                        out -> export.writeXlsx(e, q, out), f, xlsxPool, 64 * 1024))
+                .doFinally(sig -> {
+                    if (released.compareAndSet(false, true)) {
+                        xlsxSlots.release();
+                    }
+                });
+        return Mono.just(ResponseEntity.ok().headers(h).body(body));
     }
 
     /** CSV потоком: пачки по 2000 строк, UTF-8 с BOM для Excel. */
@@ -300,22 +321,79 @@ public class ForecastController {
         };
         List<Map<String, Object>> cand = data.fleetCandidates().stream().filter(keep).toList();
         List<Map<String, Object>> reserve = data.fleetReserve().stream().filter(keep).toList();
+        LocalDate pf = f == null || f.isBefore(Horizon.DAY.from) ? Horizon.DAY.from : f;
+        LocalDate pt = t == null || t.isAfter(Horizon.DAY.to) ? Horizon.DAY.to : t;
+        boolean full = !pf.isAfter(Horizon.DAY.from) && !pt.isBefore(Horizon.DAY.to);
         List<Map<String, Object>> summary = data.fleetSummary().stream()
                 .filter(m -> rs.isEmpty() || rs.contains(((Number) m.get("route")).longValue()))
+                .map(m -> full ? m : periodSummary(m, cand, reserve))
                 .toList();
+        Map<String, Object> period = new LinkedHashMap<>();
+        period.put("from", pf.toString());
+        period.put("to", pt.toString());
+        period.put("days", pt.isBefore(pf) ? 0 : DataStore.days(pf, pt));
+        period.put("full", full);
         Map<String, Object> out = new LinkedHashMap<>();
+        out.put("period", period);
         out.put("summary", summary);
         out.put("candidates", cand);
         out.put("reserve", reserve);
         out.put("method", "Вагон-час — вагон с хотя бы одной валидацией в этом часу; норма — 90-й перцентиль посадок "
                 + "на вагон-час в обычном режиме январь–октябрь; выпуск — медиана вагонов в этот час за 4 недели того же "
-                + "типа дня; добавка = ceil(прогноз / норма) − выпуск.");
+                + "типа дня; добавка = ceil(прогноз / норма) − выпуск. Парк маршрута — максимум выходов (графиков) "
+                + "на линии за час в истории; «в пределах парка сети» — сумма выпуска и добавок всех маршрутов в час "
+                + "не больше исторического максимума выходов сети, излишек срезается с наименее перегруженных маршрутов.");
         out.put("reserveMethod", "Резерв (экономия) — часы 7:00–22:59, где прогноз посадок на вагон ниже 50 % нормы "
                 + "маршрута. Оставляем need = max(ceil(прогноз / (0,7 · норма)), 2) вагонов — нагрузка не выше 70 % нормы; "
                 + "снимаем не больше 30 % планового выпуска часа, чтобы интервал движения не вырос критично. Не "
                 + "оцениваются дни, когда маршрут не в обычном режиме, и вечер 31.12 (бесплатный проезд: валидаций "
                 + "меньше, чем пассажиров).");
         return out;
+    }
+
+    /**
+     * Сводка маршрута за выбранный период: часы и вагоно-часы — по отфильтрованным строкам. Плановый выпуск и
+     * часы работы известны только за весь горизонт, поэтому доли от плана за неполный период не отдаются (null).
+     */
+    private static Map<String, Object> periodSummary(Map<String, Object> m, List<Map<String, Object>> cand,
+                                                     List<Map<String, Object>> reserve) {
+        long route = ((Number) m.get("route")).longValue();
+        List<Map<String, Object>> c = cand.stream().filter(x -> ((Number) x.get("route")).longValue() == route).toList();
+        List<Map<String, Object>> r = reserve.stream().filter(x -> ((Number) x.get("route")).longValue() == route).toList();
+        Map<String, Object> out = new LinkedHashMap<>(m);
+        out.put("candHours", c.size());
+        out.put("extraVehicleHours", sum(c, "extra"));
+        out.put("feasibleVehicleHours", sum(c, "extraFeasible"));
+        out.put("networkVehicleHours", sum(c, "extraNetwork"));
+        out.put("topHours", topHours(c));
+        out.put("reserveHours", r.size());
+        out.put("reserveVehicleHours", sum(r, "reserve"));
+        out.put("reserveTopHours", topHours(r));
+        out.put("serviceHours", null);
+        out.put("plannedVehicleHours", null);
+        out.put("candShare", null);
+        out.put("reserveShare", null);
+        return out;
+    }
+
+    private static long sum(List<Map<String, Object>> rows, String key) {
+        return rows.stream().mapToLong(x -> x.get(key) instanceof Number n ? n.longValue() : 0).sum();
+    }
+
+    /** Три самых частых часа, как в ml/fleet.py: «8:00, 17:00, 18:00». */
+    private static String topHours(List<Map<String, Object>> rows) {
+        if (rows.isEmpty()) {
+            return "—";
+        }
+        Map<Long, Long> cnt = new LinkedHashMap<>();
+        for (Map<String, Object> x : rows) {
+            cnt.merge(((Number) x.get("hour")).longValue(), 1L, Long::sum);
+        }
+        return cnt.entrySet().stream()
+                .sorted(Map.Entry.<Long, Long>comparingByValue().reversed())
+                .limit(3)
+                .map(e -> e.getKey() + ":00")
+                .collect(java.util.stream.Collectors.joining(", "));
     }
 
     @GetMapping("/quality")

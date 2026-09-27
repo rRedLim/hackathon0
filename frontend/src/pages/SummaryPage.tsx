@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react'
 import { Area, AreaChart, CartesianGrid, Legend, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
-import { API, downloadFile, errorMessage, qs, type MapResponse, type SummaryResponse } from '../api'
+import { API, downloadFile, errorMessage, qs, type HorizonMeta, type MapResponse, type SummaryResponse } from '../api'
 import { ExternalLink, Kpi, RouteBadge, Section, Spinner, StateBox } from '../components'
 import { clampDate, fmtDate, fmtNum, fmtPct, HEAT_GRADIENT, heatColor, hourLabel } from '../format'
 import { notify, useApi, useMeta } from '../hooks'
@@ -16,11 +16,14 @@ const PRESETS: { date: string; label: string }[] = [
   { date: '2026-03-09', label: '09.03.2026 сценарий' },
 ]
 
-function modeInfo(mode: string | undefined, date: string): { label: string; cls: string } {
-  const m = mode ?? (date <= '2025-10-31' ? 'history' : date <= '2025-12-31' ? 'forecast' : 'year')
-  if (m === 'history') return { label: 'факт', cls: 'mode-history' }
-  if (m === 'year') return { label: 'сценарий 2026', cls: 'mode-year' }
-  return { label: 'прогноз', cls: 'mode-forecast' }
+/** Режим сводки по самой дате — как Horizon.ofDate на бэкенде (границы из /meta). */
+function modeInfo(date: string, horizons: HorizonMeta[]): { label: string; cls: string; history: boolean } {
+  const histTo = horizons.find((h) => h.id === 'history')?.to ?? '2025-10-31'
+  const yearFrom = horizons.find((h) => h.id === 'year')?.from ?? '2026-01-01'
+  const m = date <= histTo ? 'history' : date >= yearFrom ? 'year' : 'forecast'
+  if (m === 'history') return { label: 'факт', cls: 'mode-history', history: true }
+  if (m === 'year') return { label: 'сценарий 2026', cls: 'mode-year', history: false }
+  return { label: 'прогноз', cls: 'mode-forecast', history: false }
 }
 
 const fmtSigned = (v: number) => `${v > 0 ? '+' : v < 0 ? '−' : ''}${fmtNum(Math.abs(v))}`
@@ -146,11 +149,16 @@ export default function SummaryPage() {
   const [precipMm, setPrecipMm] = useState(0)
   const [exporting, setExporting] = useState(false)
 
-  const params = { date, precip: precipMm > 0 ? `${date}:${precipMm}` : undefined }
+  const mode = modeInfo(date, meta.horizons)
+  // для факта сценарий осадков бэкенд отклоняет (400) — не отправляем
+  const params = { date, precip: precipMm > 0 && !mode.history ? `${date}:${precipMm}` : undefined }
   const sumRes = useApi<SummaryResponse>(`${API}/summary${qs(params)}`, 150)
   const mapRes = useApi<MapResponse>(`${API}/map${qs({ date })}`)
   const data = sumRes.data
-  const mode = modeInfo(data?.mode, date)
+  const changeDate = (d: string) => {
+    setDate(d)
+    if (modeInfo(d, meta.horizons).history) setPrecipMm(0)
+  }
   const colorOf = (route: number) => data?.routes.find((r) => r.route === route)?.color ?? meta.routes.find((r) => r.route === route)?.color ?? '#607d8b'
 
   const chartRows = useMemo(() => {
@@ -180,12 +188,12 @@ export default function SummaryPage() {
         <div className="row">
           <label className="field">
             <span>Дата</span>
-            <input type="date" min={MIN_DATE} max={MAX_DATE} value={date} onChange={(e) => e.target.value && setDate(clampDate(e.target.value, MIN_DATE, MAX_DATE))} />
+            <input type="date" min={MIN_DATE} max={MAX_DATE} value={date} onChange={(e) => e.target.value && changeDate(clampDate(e.target.value, MIN_DATE, MAX_DATE))} />
           </label>
           <span className={`mode-badge ${mode.cls}`}>{mode.label}</span>
           <div className="quick-dates">
             {PRESETS.map((p) => (
-              <button key={p.date} className={`btn btn-sm ${p.date === date ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setDate(p.date)}>
+              <button key={p.date} className={`btn btn-sm ${p.date === date ? 'btn-primary' : 'btn-ghost'}`} onClick={() => changeDate(p.date)}>
                 {p.label}
               </button>
             ))}
@@ -194,7 +202,7 @@ export default function SummaryPage() {
             <span>
               Что если: осадки <b>{precipMm ? `${precipMm} мм` : 'как в прогнозе'}</b>
             </span>
-            <input type="range" min={0} max={40} step={1} value={precipMm} onChange={(e) => setPrecipMm(Number(e.target.value))} disabled={mode.cls === 'mode-history'} />
+            <input type="range" min={0} max={40} step={1} value={precipMm} onChange={(e) => setPrecipMm(Number(e.target.value))} disabled={mode.history} />
           </label>
           <span className="grow" />
           {sumRes.loading && <Spinner />}

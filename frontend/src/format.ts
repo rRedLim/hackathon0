@@ -144,3 +144,8 @@ export function reserveColor(v: number, max: number): string {
 }
 
 export const RESERVE_GRADIENT = `linear-gradient(90deg, ${RESERVE_STOPS.map((c) => `rgb(${c.join(',')})`).join(', ')})`
+
+/** Вид алерта детектора: провал маршрута, всплеск, обвал всей сети. */
+export function alertKindLabel(kind: string): string {
+  return kind === 'surge' ? '▲ всплеск' : kind === 'network_drop' ? '▼ обвал сети' : '▼ провал'
+}

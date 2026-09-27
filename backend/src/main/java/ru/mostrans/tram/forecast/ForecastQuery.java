@@ -73,24 +73,33 @@ public record ForecastQuery(Horizon horizon, List<Integer> routes, List<String> 
                     continue;
                 }
                 String sid = id.trim();
-                List<Stop> entries = data.stopEntries(sid);
+                // «ID@направление» — только вхождения остановки в этом направлении: конечная общая для обоих
+                // направлений, и без уточнения суммируются посадки обоих
+                Integer dir = null;
+                String base = sid;
+                int at = sid.lastIndexOf('@');
+                if (at > 0) {
+                    base = sid.substring(0, at);
+                    dir = Scenario.integer(sid.substring(at + 1), "stops");
+                }
+                List<Stop> entries = data.stopEntries(base);
                 if (entries.isEmpty()) {
-                    throw ApiException.badRequest("stops", "Остановка «" + sid + "» не найдена");
+                    throw ApiException.badRequest("stops", "Остановка «" + base + "» не найдена");
                 }
                 if (stops.contains(sid)) {
                     continue;
                 }
                 boolean used = false;
                 for (Stop x : entries) {  // остановка может обслуживать несколько маршрутов
-                    if (routes.isEmpty() || routes.contains(x.route())) {
+                    if ((routes.isEmpty() || routes.contains(x.route())) && (dir == null || x.direction() == dir)) {
                         factor.merge(x.route(), x.weight(), Double::sum);
                         selected.add(x);
                         used = true;
                     }
                 }
                 if (!used) {
-                    throw ApiException.badRequest("stops", "Остановка " + sid + " не обслуживается выбранными "
-                            + "маршрутами " + routes);
+                    throw ApiException.badRequest("stops", "Остановка " + base + (dir == null ? "" : " в направлении "
+                            + dir) + " не обслуживается выбранными маршрутами " + routes);
                 }
                 stops.add(sid);
             }

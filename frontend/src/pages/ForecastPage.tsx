@@ -95,7 +95,8 @@ export default function ForecastPage() {
       if (routes.length !== meta.routes.length) p.routes = routes.join(',')
     } else if (level === 'stop') {
       if (!stopIds.length) return null
-      p.stops = stopIds.join(',')
+      // «ID@направление»: конечная общая для обоих направлений — берём только показанное направление
+      p.stops = stopIds.map((id) => `${id}@${stopDir}`).join(',')
       p.routes = String(stopRoute) // только выбранный маршрут, хотя остановку могут обслуживать и другие
     } else {
       if (segA === null || segB === null) return null
@@ -312,6 +313,7 @@ export default function ForecastPage() {
                     value={stopDir}
                     onChange={(e) => {
                       setStopDir(Number(e.target.value))
+                      setStopIds([])
                       setSegFrom(null)
                       setSegTo(null)
                     }}

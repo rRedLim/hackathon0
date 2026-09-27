@@ -1,6 +1,7 @@
 import { lazy, Suspense, useEffect, useMemo, useState } from 'react'
 import { API, normalizeMeta } from './api'
 import { Spinner, StateBox, Toasts } from './components'
+import { ErrorBoundary } from './ErrorBoundary'
 import { fmtScore } from './format'
 import { MetaContext, useApi } from './hooks'
 
@@ -87,13 +88,15 @@ export default function App() {
                 </div>
               }
             >
-              {tab === 'map' && <MapPage />}
-              {tab === 'summary' && <SummaryPage />}
-              {tab === 'forecast' && <ForecastPage />}
-              {tab === 'scenario' && <ScenarioPage />}
-              {tab === 'fleet' && <FleetPage />}
-              {tab === 'model' && <ModelPage />}
-              {tab === 'monitoring' && <MonitoringPage />}
+              <ErrorBoundary key={tab}>
+                {tab === 'map' && <MapPage />}
+                {tab === 'summary' && <SummaryPage />}
+                {tab === 'forecast' && <ForecastPage />}
+                {tab === 'scenario' && <ScenarioPage />}
+                {tab === 'fleet' && <FleetPage />}
+                {tab === 'model' && <ModelPage />}
+                {tab === 'monitoring' && <MonitoringPage />}
+              </ErrorBoundary>
             </Suspense>
           </MetaContext.Provider>
         )}

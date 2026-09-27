@@ -5,10 +5,12 @@ import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.LongAdder;
+import java.util.regex.Pattern;
 
 import org.springframework.stereotype.Service;
 
@@ -22,21 +24,56 @@ import ru.mostrans.tram.forecast.Horizon;
  * Приём сырых валидаций (формат train.csv/test.csv) и нормализация по правилам датасета:
  * посадка = validation_result == 1, время — tran_date_time, маршрут — число из ngpt_route.
  * Агрегаты (маршрут, дата, час) — в памяти, потокобезопасно; мониторинг сравнивает их с прогнозом.
+ * Данные разделены по рабочим областям (заголовок X-Workspace): интерфейс присылает свой идентификатор вкладки,
+ * поэтому разные пользователи демо-стенда не видят и не стирают данные друг друга. Запросы без заголовка
+ * (curl, интеграции) работают с общей областью «default».
  */
 @Service
 public class IngestService {
 
     private static final DateTimeFormatter TS = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+    public static final String DEFAULT_WORKSPACE = "default";
+    private static final Pattern WORKSPACE_ID = Pattern.compile("[A-Za-z0-9_-]{1,64}");
+    /** Рабочих областей в памяти: при превышении вытесняется та, что дольше всех не использовалась. */
+    static final int MAX_WORKSPACES = 16;
+    /** Ячеек (маршрут, дата, час) в одной области: год по 10 маршрутам — 87 600. Защита памяти. */
+    static final int MAX_CELLS = 100_000;
 
     private final DataStore data;
     private final ForecastEngine engine;
-    private final Map<Long, LongAdder> cells = new ConcurrentHashMap<>();
-    private final LongAdder totalReceived = new LongAdder();
-    private final LongAdder totalBoardings = new LongAdder();
+    private final Map<String, Workspace> workspaces = new LinkedHashMap<>(16, 0.75f, true);
+
+    /** Принятые данные одной рабочей области. */
+    static final class Workspace {
+        final Map<Long, LongAdder> cells = new ConcurrentHashMap<>();
+        final LongAdder totalReceived = new LongAdder();
+        final LongAdder totalBoardings = new LongAdder();
+    }
 
     public IngestService(DataStore data, ForecastEngine engine) {
         this.data = data;
         this.engine = engine;
+    }
+
+    /** Рабочая область по идентификатору (null или пусто — общая «default»); создаётся при первом обращении. */
+    Workspace ws(String id) {
+        String key = id == null || id.isBlank() ? DEFAULT_WORKSPACE : id.trim();
+        if (!WORKSPACE_ID.matcher(key).matches()) {
+            throw ApiException.badRequest("X-Workspace", "Заголовок X-Workspace: 1–64 символа из латинских букв, "
+                    + "цифр, «-» и «_»");
+        }
+        synchronized (workspaces) {
+            Workspace w = workspaces.get(key);  // access-order: обращение продлевает жизнь области
+            if (w == null) {
+                if (workspaces.size() >= MAX_WORKSPACES) {
+                    String eldest = workspaces.keySet().iterator().next();
+                    workspaces.remove(eldest);
+                }
+                w = new Workspace();
+                workspaces.put(key, w);
+            }
+            return w;
+        }
     }
 
     public record Stats(long received, long accepted, long rejected, long boardings, int cells) {
@@ -47,6 +84,7 @@ public class IngestService {
 
     /** Разбор CSV построчно (заголовок — первая строка); состояние разбора одного запроса. */
     public final class CsvBatch {
+        private final Workspace w;
         private int iTs = -1;
         private int iRes = -1;
         private int iRoute = -1;
@@ -55,6 +93,10 @@ public class IngestService {
         private long accepted;
         private long rejected;
         private long boardings;
+
+        private CsvBatch(Workspace w) {
+            this.w = w;
+        }
 
         public void line(String raw) {
             String line = raw.endsWith("\r") ? raw.substring(0, raw.length() - 1) : raw;
@@ -73,7 +115,7 @@ public class IngestService {
                 return;
             }
             Integer res = parseInt(f.get(iRes).trim());
-            int r = record(f.get(iTs).trim(), res, f.get(iRoute).trim());
+            int r = record(w, f.get(iTs).trim(), res, f.get(iRoute).trim());
             if (r < 0) {
                 rejected++;
             } else {
@@ -105,21 +147,22 @@ public class IngestService {
             if (iTs < 0) {
                 throw ApiException.badRequest("body", "Пустое тело: ожидается CSV с заголовком (формат train.csv)");
             }
-            totalReceived.add(received);
-            return new Stats(received, accepted, rejected, boardings, cells.size());
+            w.totalReceived.add(received);
+            return new Stats(received, accepted, rejected, boardings, w.cells.size());
         }
     }
 
-    public CsvBatch csvBatch() {
-        return new CsvBatch();
+    public CsvBatch csvBatch(String workspace) {
+        return new CsvBatch(ws(workspace));
     }
 
-    public Stats ingestJson(List<Validation> items) {
+    public Stats ingestJson(String workspace, List<Validation> items) {
+        Workspace w = ws(workspace);
         long acc = 0;
         long rej = 0;
         long b = 0;
         for (Validation v : items) {
-            int r = v == null ? -1 : record(v.tranDateTime(), v.validationResult(), v.ngptRoute());
+            int r = v == null ? -1 : record(w, v.tranDateTime(), v.validationResult(), v.ngptRoute());
             if (r < 0) {
                 rej++;
             } else {
@@ -127,12 +170,12 @@ public class IngestService {
                 b += r;
             }
         }
-        totalReceived.add(items.size());
-        return new Stats(items.size(), acc, rej, b, cells.size());
+        w.totalReceived.add(items.size());
+        return new Stats(items.size(), acc, rej, b, w.cells.size());
     }
 
-    /** @return 1 — посадка учтена, 0 — валидная запись-отказ, −1 — запись не разобрана. */
-    int record(String ts, Integer result, String route) {
+    /** @return 1 — посадка учтена, 0 — валидная запись-отказ, −1 — запись не разобрана или не помещается. */
+    int record(Workspace w, String ts, Integer result, String route) {
         if (ts == null || result == null || route == null) {
             return -1;
         }
@@ -154,8 +197,12 @@ public class IngestService {
         if (result != 1) {
             return 0;
         }
-        cells.computeIfAbsent(key(r, t.toLocalDate(), t.getHour()), x -> new LongAdder()).increment();
-        totalBoardings.increment();
+        LongAdder cell = cell(w, key(r, t.toLocalDate(), t.getHour()));
+        if (cell == null) {
+            return -1;
+        }
+        cell.increment();
+        w.totalBoardings.increment();
         return 1;
     }
 
@@ -171,10 +218,20 @@ public class IngestService {
         return (d.toEpochDay() * 24 + hour) * 1000 + route;
     }
 
-    public void reset() {
-        cells.clear();
-        totalReceived.reset();
-        totalBoardings.reset();
+    /** Ячейка области; null — область заполнена (MAX_CELLS), новая ячейка не создаётся. */
+    private static LongAdder cell(Workspace w, long key) {
+        LongAdder a = w.cells.get(key);
+        if (a != null || w.cells.size() >= MAX_CELLS) {
+            return a;
+        }
+        return w.cells.computeIfAbsent(key, x -> new LongAdder());
+    }
+
+    public void reset(String workspace) {
+        Workspace w = ws(workspace);
+        w.cells.clear();
+        w.totalReceived.reset();
+        w.totalBoardings.reset();
     }
 
     // ------------------------------------------------------------------ мониторинг
@@ -205,7 +262,11 @@ public class IngestService {
      * Факт против прогноза на дату. WAPE-score считается только по «принятым» часам — где факт по сети
      * набрал не меньше половины прогноза: незавершённый поток и единичные запоздавшие записи не штрафуются.
      */
-    public Monitoring monitoring(LocalDate d, double threshold, int minHours) {
+    public Monitoring monitoring(String workspace, LocalDate d, double threshold, int minHours) {
+        return monitoring(ws(workspace), d, threshold, minHours);
+    }
+
+    private Monitoring monitoring(Workspace w, LocalDate d, double threshold, int minHours) {
         Horizon h = Horizon.ofDate(d);
         long[][] actual = new long[DataStore.ROUTES.length][24];
         double[][] fcst = new double[DataStore.ROUTES.length][24];
@@ -217,7 +278,7 @@ public class IngestService {
             int route = DataStore.ROUTES[i];
             int k = data.indexOf(route);
             for (int hour = 0; hour < 24; hour++) {
-                LongAdder a = cells.get(key(route, d, hour));
+                LongAdder a = w.cells.get(key(route, d, hour));
                 actual[i][hour] = a == null ? 0 : a.sum();
                 if (a != null) {
                     lastHour = Math.max(lastHour, hour);
@@ -271,12 +332,62 @@ public class IngestService {
             case YEAR -> "сценарий 2026";
             default -> "прогноз модели";
         };
-        List<Alert> alerts = detect(actual, fcst, hasFc, covered, threshold, minHours);
+        List<Alert> alerts = new ArrayList<>(networkDrop(d, actual, fcst, netAct, netFc, lastHour, minHours));
+        alerts.addAll(detect(actual, fcst, hasFc, covered, threshold, minHours));
         return new Monitoring(d, src, lastHour < 0 ? null : lastHour, covered, out, act,
                 h == null ? null : Math.round(fc * 10.0) / 10.0, covAct,
                 h == null ? null : Math.round(covFc * 10.0) / 10.0,
-                score == null ? null : Math.round(score * 10000.0) / 10000.0, totalReceived.sum(),
-                totalBoardings.sum(), alerts, new AlertParams(threshold, minHours, ALERT_MIN_FORECAST));
+                score == null ? null : Math.round(score * 10000.0) / 10000.0, w.totalReceived.sum(),
+                w.totalBoardings.sum(), alerts, new AlertParams(threshold, minHours, ALERT_MIN_FORECAST));
+    }
+
+    /**
+     * Обвал всей сети: часы с данными, где факт по сети ниже половины прогноза, а данные пришли хотя бы по половине
+     * маршрутов (иначе это частичная загрузка одного-двух маршрутов, а не падение). Такие часы не «принимаются» и
+     * не входят в WAPE-score, поэтому маршрутный детектор их не видит — нужен отдельный сигнал.
+     */
+    static List<Alert> networkDrop(LocalDate d, long[][] actual, double[][] fcst, long[] netAct, double[] netFc,
+                                   int lastHour, int minHours) {
+        List<Alert> out = new ArrayList<>();
+        int start = -1;
+        for (int hour = 0; hour <= lastHour + 1; hour++) {
+            boolean low = false;
+            if (hour <= lastHour && !(d.equals(DataStore.FC_START) && hour <= 1)
+                    && netFc[hour] >= ALERT_MIN_FORECAST * DataStore.ROUTES.length) {
+                int withFc = 0;
+                int withData = 0;
+                for (int i = 0; i < DataStore.ROUTES.length; i++) {
+                    if (fcst[i][hour] >= ALERT_MIN_FORECAST) {
+                        withFc++;
+                        withData += actual[i][hour] > 0 ? 1 : 0;
+                    }
+                }
+                low = netAct[hour] < 0.5 * netFc[hour] && withFc > 0 && withData * 2 >= withFc;
+            }
+            if (low) {
+                if (start < 0) {
+                    start = hour;
+                }
+                continue;
+            }
+            if (start >= 0 && hour - start >= minHours) {
+                long a = 0;
+                double f = 0;
+                for (int x = start; x < hour; x++) {
+                    a += netAct[x];
+                    f += netFc[x];
+                }
+                double dev = Math.round((a - f) / f * 1000.0) / 10.0;
+                String span = String.format("%02d:00–%02d:00", start, hour);
+                out.add(new Alert(0, start, hour - 1, hour - start, a, Math.round(f * 10.0) / 10.0, dev, "network_drop",
+                        String.format(java.util.Locale.forLanguageTag("ru"), "Вся сеть: факт ниже прогноза на %.0f %% "
+                                + "%d ч подряд (%s) по большинству маршрутов — вероятно сбой валидаторов или передачи "
+                                + "данных либо массовое нарушение движения. Эти часы не входят в WAPE-score и в "
+                                + "маршрутный детектор.", -dev, hour - start, span)));
+            }
+            start = -1;
+        }
+        return out;
     }
 
     /**
@@ -341,13 +452,14 @@ public class IngestService {
     }
 
     /** Принятый факт по маршрутам и часам на дату + алерты детектора (порог по умолчанию) — для карты «live». */
-    public Live live(LocalDate d) {
+    public Live live(String workspace, LocalDate d) {
+        Workspace w = ws(workspace);
         List<LiveRoute> routes = new ArrayList<>();
         int last = -1;
         for (int route : DataStore.ROUTES) {
             long[] h = new long[24];
             for (int hour = 0; hour < 24; hour++) {
-                LongAdder a = cells.get(key(route, d, hour));
+                LongAdder a = w.cells.get(key(route, d, hour));
                 if (a != null) {
                     h[hour] = a.sum();
                     last = Math.max(last, hour);
@@ -356,8 +468,8 @@ public class IngestService {
             routes.add(new LiveRoute(route, h));
         }
         List<Alert> alerts = last < 0 || Horizon.ofDate(d) == null ? List.of()
-                : monitoring(d, DEFAULT_THRESHOLD, DEFAULT_MIN_HOURS).alerts();
-        return new Live(d, last >= 0, last < 0 ? null : last, totalReceived.sum(), routes, alerts);
+                : monitoring(w, d, DEFAULT_THRESHOLD, DEFAULT_MIN_HOURS).alerts();
+        return new Live(d, last >= 0, last < 0 ? null : last, w.totalReceived.sum(), routes, alerts);
     }
 
     // ------------------------------------------------------------------ симуляция потока (демо детектора)
@@ -365,10 +477,12 @@ public class IngestService {
     /**
      * Симуляция потока валидаций на дату: посадки = прогноз (для истории — факт) × шум ±5 %, с внедрённой
      * аномалией (множитель на маршрут в часах). Нужна для демонстрации детектора: реальных данных за
-     * прогнозный период нет. Результат помечается simulated=true.
+     * прогнозный период нет. Результат помечается simulated=true. Симуляция заменяет принятые данные этой даты
+     * (а не прибавляется к ним): повторный запуск с другими параметрами показывает новый сценарий.
      */
-    public Stats simulate(LocalDate d, int toHour, Integer anomalyRoute, int anomalyFrom, int anomalyTo,
-                          double anomalyMult, long seed) {
+    public Stats simulate(String workspace, LocalDate d, int toHour, Integer anomalyRoute, int anomalyFrom,
+                          int anomalyTo, double anomalyMult, long seed) {
+        Workspace w = ws(workspace);
         Horizon h = Horizon.ofDate(d);
         if (h == null) {
             throw ApiException.badRequest("date", "Дата " + d + " вне периода сервиса (" + DataStore.HIST_START
@@ -378,6 +492,14 @@ public class IngestService {
         double[] row = new double[24];
         long boardings = 0;
         for (int route : DataStore.ROUTES) {
+            for (int hour = 0; hour < 24; hour++) {
+                LongAdder old = w.cells.remove(key(route, d, hour));
+                if (old != null) {
+                    w.totalBoardings.add(-old.sum());
+                }
+            }
+        }
+        for (int route : DataStore.ROUTES) {
             engine.day(h, data.indexOf(route), d, row);
             for (int hour = 0; hour <= toHour; hour++) {
                 double v = row[hour] * (1 + 0.05 * rnd.nextGaussian());
@@ -385,14 +507,15 @@ public class IngestService {
                     v *= anomalyMult;
                 }
                 long n = Math.max(0, Math.round(v));
-                if (n > 0) {
-                    cells.computeIfAbsent(key(route, d, hour), x -> new LongAdder()).add(n);
+                LongAdder cell = n > 0 ? cell(w, key(route, d, hour)) : null;
+                if (cell != null) {
+                    cell.add(n);
                     boardings += n;
                 }
             }
         }
-        totalReceived.add(boardings);
-        totalBoardings.add(boardings);
-        return new Stats(boardings, boardings, 0, boardings, cells.size());
+        w.totalReceived.add(boardings);
+        w.totalBoardings.add(boardings);
+        return new Stats(boardings, boardings, 0, boardings, w.cells.size());
     }
 }

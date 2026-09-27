@@ -214,6 +214,11 @@ export function RouteBadge({ route, color }: { route: number | string; color: st
   )
 }
 
+/** Шапка алерта детектора: маршрут (или «сеть» для обвала всей сети), вид отклонения. */
+export function AlertTarget({ route, color }: { route: number; color: string }) {
+  return route === 0 ? <span className="route-badge" style={{ background: '#37474f' }}>сеть</span> : <RouteBadge route={route} color={color} />
+}
+
 export function Section({ title, extra, children, className }: { title?: ReactNode; extra?: ReactNode; children: ReactNode; className?: string }) {
   return (
     <section className={`card ${className ?? ''}`}>

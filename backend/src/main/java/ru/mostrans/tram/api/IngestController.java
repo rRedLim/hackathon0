@@ -12,6 +12,7 @@ import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
@@ -29,8 +30,12 @@ import ru.mostrans.tram.ingest.IngestService;
 
 @RestController
 @RequestMapping("/api/v1")
-@Tag(name = "Приём данных", description = "Потоковый приём сырых валидаций и мониторинг факта против прогноза")
+@Tag(name = "Приём данных", description = "Потоковый приём сырых валидаций и мониторинг факта против прогноза. "
+        + "Данные разделены по рабочим областям: заголовок X-Workspace (интерфейс присылает идентификатор своей "
+        + "вкладки); без заголовка — общая область «default»")
 public class IngestController {
+
+    static final String WS = "X-Workspace";
 
     /** Построчный декодер: тело CSV не собирается в память целиком. */
     private static final StringDecoder LINES = StringDecoder.textPlainOnly(List.of("\n"), true);
@@ -41,7 +46,8 @@ public class IngestController {
         this.ingest = ingest;
     }
 
-    @PostMapping(value = "/ingest/validations", consumes = {"text/csv", "text/plain", "application/csv"})
+    // text/plain не принимается: иначе чужой сайт мог бы отправить данные «простым» запросом без CORS-проверки
+    @PostMapping(value = "/ingest/validations", consumes = {"text/csv", "application/csv"})
     @Operation(summary = "Приём сырых валидаций: CSV (формат train.csv, «;», потоково) или JSON",
             description = "Посадка = validation_result 1, маршрут — число из ngpt_route, время — tran_date_time. "
                     + "Для CSV нужны колонки tran_date_time, validation_result, ngpt_route (остальные колонки train.csv "
@@ -54,8 +60,9 @@ public class IngestController {
                     @Content(mediaType = "application/json", examples = @ExampleObject(name = "json",
                             value = "[{\"tranDateTime\":\"2025-11-10 08:10:00\",\"validationResult\":1,"
                                     + "\"ngptRoute\":\"7 трамвай\"}]"))}))
-    public Mono<IngestService.Stats> ingestCsv(@RequestBody Flux<DataBuffer> body) {
-        IngestService.CsvBatch batch = ingest.csvBatch();
+    public Mono<IngestService.Stats> ingestCsv(@RequestHeader(value = WS, required = false) String ws,
+                                               @RequestBody Flux<DataBuffer> body) {
+        IngestService.CsvBatch batch = ingest.csvBatch(ws);
         return LINES.decode(body, ResolvableType.forClass(String.class), MediaType.TEXT_PLAIN, null)
                 .publishOn(Schedulers.boundedElastic())
                 .doOnNext(batch::line)
@@ -64,16 +71,17 @@ public class IngestController {
 
     @PostMapping(value = "/ingest/validations", consumes = MediaType.APPLICATION_JSON_VALUE)
     @Operation(hidden = true) // тот же путь, описан в ingestCsv (Swagger объединяет операции одного пути)
-    public IngestService.Stats ingestJson(@RequestBody List<IngestService.Validation> items) {
-        return ingest.ingestJson(items);
+    public IngestService.Stats ingestJson(@RequestHeader(value = WS, required = false) String ws,
+                                          @RequestBody List<IngestService.Validation> items) {
+        return ingest.ingestJson(ws, items);
     }
 
     @DeleteMapping("/ingest")
-    @Operation(summary = "Сброс принятых данных",
+    @Operation(summary = "Сброс принятых данных рабочей области (X-Workspace, без заголовка — «default»)",
             responses = @ApiResponse(responseCode = "200", content = @Content(mediaType = "application/json",
                     examples = @ExampleObject(value = "{\"status\":\"ok\"}"))))
-    public Map<String, String> reset() {
-        ingest.reset();
+    public Map<String, String> reset(@RequestHeader(value = WS, required = false) String ws) {
+        ingest.reset(ws);
         return Map.of("status", "ok");
     }
 
@@ -81,7 +89,8 @@ public class IngestController {
     @Operation(summary = "Факт из приёма против прогноза на дату, WAPE-score и детектор смены режима",
             description = "threshold — порог отклонения (0.05–0.9, по умолчанию 0.25), minHours — сколько часов "
                     + "подряд (1–12, по умолчанию 2)")
-    public IngestService.Monitoring monitoring(@RequestParam(required = false) String date,
+    public IngestService.Monitoring monitoring(@RequestHeader(value = WS, required = false) String ws,
+                                               @RequestParam(required = false) String date,
                                                @RequestParam(required = false) String threshold,
                                                @RequestParam(required = false) String minHours) {
         if (date == null || date.isBlank()) {
@@ -90,22 +99,24 @@ public class IngestController {
         LocalDate d = ForecastController.parseDate(date, "date");
         double th = blank(threshold) ? IngestService.DEFAULT_THRESHOLD : number(threshold, "threshold", 0.05, 0.9);
         int mh = blank(minHours) ? IngestService.DEFAULT_MIN_HOURS : (int) integer(minHours, "minHours", 1, 12);
-        return ingest.monitoring(d, th, mh);
+        return ingest.monitoring(ws, d, th, mh);
     }
 
     @GetMapping("/map/live")
     @Operation(summary = "Живой факт для карты: принятые посадки по маршрутам и часам на дату и алерты детектора")
-    public IngestService.Live live(@RequestParam(required = false) String date) {
+    public IngestService.Live live(@RequestHeader(value = WS, required = false) String ws,
+                                   @RequestParam(required = false) String date) {
         if (blank(date)) {
             throw ApiException.badRequest("date", "Параметр date обязателен (YYYY-MM-DD)");
         }
-        return ingest.live(ForecastController.parseDate(date, "date"));
+        return ingest.live(ws, ForecastController.parseDate(date, "date"));
     }
 
     @PostMapping("/ingest/simulate")
     @Operation(summary = "Симуляция потока валидаций на дату с внедрённой аномалией — демонстрация детектора",
             description = "Посадки = прогноз ± 5 % шума; anomalyRoute/anomalyFromHour/anomalyToHour/anomalyMult задают "
-                    + "аномалию (например, ремонт: ×0.4). Данные помечаются как симуляция.",
+                    + "аномалию (например, ремонт: ×0.4). Симуляция заменяет принятые данные этой даты в рабочей "
+                    + "области (повторный запуск не суммируется).",
             parameters = {
                     @io.swagger.v3.oas.annotations.Parameter(name = "date", description = "Дата", example = "2025-11-10", required = true),
                     @io.swagger.v3.oas.annotations.Parameter(name = "toHour", description = "Поток до часа (0–23)", example = "14"),
@@ -117,7 +128,8 @@ public class IngestController {
             responses = @ApiResponse(responseCode = "200", content = @Content(mediaType = "application/json",
                     examples = @ExampleObject(value = "{\"received\":131826,\"accepted\":131826,\"rejected\":0,"
                             + "\"boardings\":131826,\"cells\":113,\"simulated\":true}"))))
-    public Map<String, Object> simulate(@RequestParam(required = false) String date,
+    public Map<String, Object> simulate(@RequestHeader(value = WS, required = false) String ws,
+                                        @RequestParam(required = false) String date,
                                         @RequestParam(required = false) String toHour,
                                         @RequestParam(required = false) String anomalyRoute,
                                         @RequestParam(required = false) String anomalyFromHour,
@@ -147,7 +159,7 @@ public class IngestController {
         }
         double mult = blank(anomalyMult) ? 0.4 : number(anomalyMult, "anomalyMult", 0, 5);
         long sd = blank(seed) ? 42 : integer(seed, "seed", Long.MIN_VALUE, Long.MAX_VALUE);
-        IngestService.Stats s = ingest.simulate(d, to, route, af, at, mult, sd);
+        IngestService.Stats s = ingest.simulate(ws, d, to, route, af, at, mult, sd);
         Map<String, Object> out = new java.util.LinkedHashMap<>();
         out.put("received", s.received());
         out.put("accepted", s.accepted());

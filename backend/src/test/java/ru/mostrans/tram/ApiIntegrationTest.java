@@ -24,6 +24,9 @@ class ApiIntegrationTest {
     @Autowired
     WebTestClient web;
 
+    @org.springframework.boot.test.web.server.LocalServerPort
+    int port;
+
     @SuppressWarnings("unchecked")
     Map<String, Object> get(String uri) {
         return web.mutate().codecs(c -> c.defaultCodecs().maxInMemorySize(16 * 1024 * 1024)).build()
@@ -159,7 +162,7 @@ class ApiIntegrationTest {
                 .exchange().expectStatus().isOk().expectBody().returnResult().getResponseBody();
         List<String> lines = new String(body, StandardCharsets.UTF_8).lines().skip(1).toList();
         assertThat(lines).hasSize(3);
-        double sum = lines.stream().mapToDouble(l -> Double.parseDouble(l.split(";")[8])).sum();
+        double sum = lines.stream().mapToDouble(l -> Double.parseDouble(l.split(";")[8].replace(',', '.'))).sum();
         assertThat(sum).isCloseTo(seg, org.assertj.core.data.Offset.offset(0.1));
     }
 
@@ -254,5 +257,133 @@ class ApiIntegrationTest {
                 .jsonPath("$.lastHour").isEqualTo(10)
                 .jsonPath("$.routes.length()").isEqualTo(10);
         web.delete().uri("/api/v1/ingest").exchange().expectStatus().isOk();
+    }
+
+    // ------------------------------------------------------------------ исправления по аудиту
+
+    @Test
+    void repeatedSimulationReplacesDateInsteadOfSumming() {
+        String ws = "test-repeat";
+        for (int run = 0; run < 2; run++) {
+            web.post().uri("/api/v1/ingest/simulate?date=2025-11-13&toHour=14&anomalyRoute=7&anomalyFromHour=9"
+                    + "&anomalyToHour=12&anomalyMult=0.4").header("X-Workspace", ws).exchange().expectStatus().isOk();
+        }
+        web.get().uri("/api/v1/monitoring?date=2025-11-13").header("X-Workspace", ws).exchange().expectStatus().isOk()
+                .expectBody()
+                .jsonPath("$.alerts.length()").isEqualTo(1)
+                .jsonPath("$.alerts[0].route").isEqualTo(7)
+                .jsonPath("$.wapeScore").value(v -> assertThat(((Number) v).doubleValue()).isGreaterThan(0.85));
+        web.delete().uri("/api/v1/ingest").header("X-Workspace", ws).exchange().expectStatus().isOk();
+    }
+
+    @Test
+    void workspacesAreIsolated() {
+        web.post().uri("/api/v1/ingest/simulate?date=2025-11-14&toHour=10").header("X-Workspace", "ws-a")
+                .exchange().expectStatus().isOk();
+        web.get().uri("/api/v1/monitoring?date=2025-11-14").header("X-Workspace", "ws-b").exchange()
+                .expectBody().jsonPath("$.actualTotal").isEqualTo(0);
+        web.delete().uri("/api/v1/ingest").header("X-Workspace", "ws-b").exchange().expectStatus().isOk();
+        web.get().uri("/api/v1/map/live?date=2025-11-14").header("X-Workspace", "ws-a").exchange()
+                .expectBody().jsonPath("$.available").isEqualTo(true);
+        web.get().uri("/api/v1/monitoring?date=2025-11-14").header("X-Workspace", "bad id!").exchange()
+                .expectStatus().isBadRequest();
+        web.delete().uri("/api/v1/ingest").header("X-Workspace", "ws-a").exchange().expectStatus().isOk();
+    }
+
+    @Test
+    void textPlainIngestIsRejected() {
+        web.post().uri("/api/v1/ingest/validations").contentType(MediaType.TEXT_PLAIN)
+                .bodyValue("tran_date_time;validation_result;ngpt_route\n2025-11-10 08:00:00;1;7 трамвай\n")
+                .exchange().expectStatus().isEqualTo(415);
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void fleetSummaryFollowsSelectedPeriod() {
+        Map<String, Object> day = get("/api/v1/fleet?from=2025-11-10&to=2025-11-10");
+        Map<String, Object> period = (Map<String, Object>) day.get("period");
+        assertThat(period.get("days")).isEqualTo(1);
+        assertThat(period.get("full")).isEqualTo(false);
+        List<Map<String, Object>> summary = (List<Map<String, Object>>) day.get("summary");
+        long extra = summary.stream().mapToLong(m -> ((Number) m.get("extraVehicleHours")).longValue()).sum();
+        long reserve = summary.stream().mapToLong(m -> ((Number) m.get("reserveVehicleHours")).longValue()).sum();
+        long candExtra = ((List<Map<String, Object>>) day.get("candidates")).stream()
+                .mapToLong(m -> ((Number) m.get("extra")).longValue()).sum();
+        long rowsReserve = ((List<Map<String, Object>>) day.get("reserve")).stream()
+                .mapToLong(m -> ((Number) m.get("reserve")).longValue()).sum();
+        assertThat(extra).isEqualTo(candExtra).isPositive();
+        assertThat(reserve).isEqualTo(rowsReserve);
+        assertThat(summary.get(0).get("plannedVehicleHours")).isNull();
+
+        Map<String, Object> all = get("/api/v1/fleet");
+        assertThat(((Map<String, Object>) all.get("period")).get("full")).isEqualTo(true);
+        for (Map<String, Object> m : (List<Map<String, Object>>) all.get("summary")) {
+            long need = ((Number) m.get("extraVehicleHours")).longValue();
+            long feasible = ((Number) m.get("feasibleVehicleHours")).longValue();
+            long network = ((Number) m.get("networkVehicleHours")).longValue();
+            assertThat(network).isLessThanOrEqualTo(feasible);
+            assertThat(feasible).isLessThanOrEqualTo(need);
+            assertThat(m.get("plannedVehicleHours")).isNotNull();
+        }
+    }
+
+    @Test
+    void stopDirectionQualifierSelectsOneDirection() {
+        double both = ((Number) totals(get("/api/v1/forecast?stops=2594&granularity=total")).get("pred")).doubleValue();
+        double d0 = ((Number) totals(get("/api/v1/forecast?stops=2594@0&granularity=total")).get("pred")).doubleValue();
+        double d1 = ((Number) totals(get("/api/v1/forecast?stops=2594@1&granularity=total")).get("pred")).doubleValue();
+        assertThat(d0).isPositive().isLessThan(both);
+        assertThat(d0 + d1).isCloseTo(both, org.assertj.core.data.Offset.offset(1.0));
+        web.get().uri("/api/v1/forecast?stops=2594@7").exchange().expectStatus().isBadRequest();
+    }
+
+    @Test
+    void csvUsesDecimalCommaWithoutExponent() {
+        byte[] body = web.get().uri("/api/v1/export?format=csv&horizon=month&granularity=month&split=none")
+                .exchange().expectStatus().isOk().expectBody().returnResult().getResponseBody();
+        List<String> lines = new String(body, StandardCharsets.UTF_8).lines().skip(1).toList();
+        assertThat(lines).isNotEmpty();
+        for (String l : lines) {
+            String[] f = l.split(";", -1);
+            for (int c = 7; c <= 10; c++) {
+                assertThat(f[c]).doesNotContain("E").doesNotContain(".");
+            }
+        }
+        assertThat(String.join("\n", lines)).contains(",");
+    }
+
+    @Test
+    void parallelXlsxExportsAreLimitedAndStreamed() {
+        String uri = "/api/v1/export?format=xlsx&level=stop&granularity=hour&from=2025-11-01&to=2025-11-30";
+        org.springframework.web.reactive.function.client.WebClient client =
+                org.springframework.web.reactive.function.client.WebClient.create("http://localhost:" + port);
+        // 5 одновременных тяжёлых XLSX: 2 отдаются потоком, остальные сразу получают 503 problem+json
+        List<long[]> res = reactor.core.publisher.Flux.range(0, 5)
+                .flatMap(i -> client.get().uri(uri).exchangeToMono(r -> r.bodyToFlux(
+                                org.springframework.core.io.buffer.DataBuffer.class)
+                        .reduce(new long[] {r.statusCode().value(), 0, -1, -1}, (acc, b) -> {
+                            if (acc[2] < 0 && b.readableByteCount() >= 2) {
+                                acc[2] = b.getByte(b.readPosition());
+                                acc[3] = b.getByte(b.readPosition() + 1);
+                            }
+                            acc[1] += b.readableByteCount();
+                            org.springframework.core.io.buffer.DataBufferUtils.release(b);
+                            return acc;
+                        })), 5)
+                .collectList().block(java.time.Duration.ofMinutes(3));
+        assertThat(res).extracting(x -> x[0]).contains(200L).contains(503L).allMatch(c -> c == 200L || c == 503L);
+        for (long[] x : res) {
+            if (x[0] == 200) {
+                assertThat(x[1]).isGreaterThan(1_000_000);   // полный файл, не обрезан
+                assertThat(x[2]).isEqualTo((long) 'P');      // zip-контейнер XLSX
+                assertThat(x[3]).isEqualTo((long) 'K');
+            }
+        }
+    }
+
+    @Test
+    void openApiServerIsRelative() {
+        web.get().uri("/v3/api-docs").exchange().expectStatus().isOk()
+                .expectBody().jsonPath("$.servers[0].url").isEqualTo("/");
     }
 }

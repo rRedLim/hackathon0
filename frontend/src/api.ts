@@ -135,18 +135,23 @@ export interface MapResponse {
 export interface FleetSummary {
   route: number
   normBpv: number
+  /** парк маршрута: максимум выходов (графиков) на линии за час в истории */
   fleetMax: number
-  serviceHours: number
+  /** за неполный период — null: часы работы и плановый выпуск известны только за весь горизонт */
+  serviceHours: number | null
   candHours: number
   extraVehicleHours: number
   feasibleVehicleHours?: number
+  /** добавка в пределах парка сети (сумма выпуска всех маршрутов в час ≤ исторического максимума выходов сети) */
+  networkVehicleHours?: number
+  networkFleetMax?: number
   topHours: string
-  candShare: number
+  candShare: number | null
   reserveHours?: number
   reserveVehicleHours?: number
   reserveTopHours?: string
-  plannedVehicleHours?: number
-  reserveShare?: number
+  plannedVehicleHours?: number | null
+  reserveShare?: number | null
 }
 
 export interface FleetReserve {
@@ -171,9 +176,12 @@ export interface FleetCandidate {
   norm: number
   extra: number
   extraFeasible?: number
+  extraNetwork?: number
 }
 
 export interface FleetResponse {
+  /** фактический период расчёта сводки; full — весь горизонт 1.11–31.12 */
+  period?: { from: string; to: string; days: number; full: boolean }
   summary: FleetSummary[]
   candidates: FleetCandidate[]
   reserve?: FleetReserve[]
@@ -246,7 +254,8 @@ export interface MonitoringAlert {
   actual: number
   forecast: number
   deviationPct: number
-  kind: 'drop' | 'surge'
+  /** network_drop — обвал всей сети (route = 0) */
+  kind: 'drop' | 'surge' | 'network_drop'
   message: string
 }
 
@@ -383,6 +392,23 @@ export async function downloadFile(url: string): Promise<void> {
   setTimeout(() => URL.revokeObjectURL(link.href), 30_000)
 }
 
+/**
+ * Рабочая область приёма данных (заголовок X-Workspace): своя у каждой вкладки браузера, чтобы пользователи
+ * демо-стенда не видели и не стирали симуляции и загрузки друг друга. Живёт в sessionStorage — переживает F5.
+ */
+export const WORKSPACE: string = (() => {
+  const make = () => `ui-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+  try {
+    const saved = sessionStorage.getItem('tram-workspace')
+    if (saved && /^[A-Za-z0-9_-]{1,64}$/.test(saved)) return saved
+    const id = make()
+    sessionStorage.setItem('tram-workspace', id)
+    return id
+  } catch {
+    return make()
+  }
+})()
+
 export async function apiRequest<T>(
   url: string,
   init: { method?: string; body?: BodyInit; contentType?: string; signal?: AbortSignal } = {},
@@ -395,6 +421,7 @@ export async function apiRequest<T>(
       signal: init.signal,
       headers: {
         Accept: 'application/json, application/problem+json',
+        'X-Workspace': WORKSPACE,
         ...(init.contentType ? { 'Content-Type': init.contentType } : {}),
       },
     })

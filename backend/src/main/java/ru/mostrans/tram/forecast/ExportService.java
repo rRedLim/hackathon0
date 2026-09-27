@@ -157,11 +157,12 @@ public class ExportService {
         return s;
     }
 
-    private static String num(double v) {
+    /** Число для CSV под русский Excel (разделитель «;»): десятичная запятая, без экспоненты. */
+    static String num(double v) {
         if (v == Math.rint(v) && Math.abs(v) < 1e15) {
             return Long.toString((long) v);
         }
-        return Double.toString(v);
+        return java.math.BigDecimal.valueOf(v).stripTrailingZeros().toPlainString().replace('.', ',');
     }
 
     public void writeXlsx(Export e, ForecastQuery q, OutputStream out) {

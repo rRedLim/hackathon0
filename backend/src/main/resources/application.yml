@@ -19,7 +19,7 @@ spring:
 app:
   # каталог с данными сервиса (результат pipeline/build_service_data.py)
   data-dir: ${APP_DATA_DIR:../service_data}
-  cors-origins: ${APP_CORS_ORIGINS:*}
+  cors-origins: ${APP_CORS_ORIGINS:}
 
 management:
   endpoints:
