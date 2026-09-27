@@ -1,0 +1,16 @@
+# контекст сборки backend — корень репозитория; нужны только Tramvay/ml (артефакты), data/reference, pipeline, backend
+*.zip
+*.rar
+data_raw
+.venv
+**/node_modules
+**/target
+frontend
+service_data
+docs
+Tramvay/ml/submissions
+Tramvay/data_analyze
+Tramvay/submission.csv
+**/__pycache__
+.git
+.omc

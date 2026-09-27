@@ -1,0 +1,48 @@
+server:
+  port: ${PORT:8080}
+  compression:
+    enabled: true
+    mime-types: application/json,application/problem+json,text/csv
+    min-response-size: 2048
+  shutdown: graceful
+
+spring:
+  application:
+    name: tram-forecast
+  main:
+    banner-mode: off
+  codec:
+    max-in-memory-size: 16MB
+  lifecycle:
+    timeout-per-shutdown-phase: 10s
+
+app:
+  # каталог с данными сервиса (результат pipeline/build_service_data.py)
+  data-dir: ${APP_DATA_DIR:../service_data}
+  cors-origins: ${APP_CORS_ORIGINS:*}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+  metrics:
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+      percentiles:
+        http.server.requests: 0.5,0.95,0.99
+
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+
+logging:
+  level:
+    root: INFO

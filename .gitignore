@@ -1,0 +1,16 @@
+# исходные архивы организаторов (датасет 2.7 ГБ — не коммитим)
+*.zip
+*.rar
+data_raw/
+Tramvay/dataset
+# генерируемое
+service_data/
+.venv/
+__pycache__/
+node_modules/
+target/
+dist/
+.omc/
+.idea/
+.vscode/
+*.pdf

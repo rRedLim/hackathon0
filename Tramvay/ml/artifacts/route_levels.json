@@ -1,0 +1,23 @@
+{
+ "17": {
+  "mult_probe": 1.03,
+  "delta_score": -0.0023,
+  "sigma": 0.0803,
+  "k_star": 0.9813,
+  "gain_vs_ref": 0.00042
+ },
+ "12": {
+  "mult_probe": 1.03,
+  "delta_score": -0.00097,
+  "sigma": 0.1147,
+  "k_star": 0.9835,
+  "gain_vs_ref": 0.00014
+ },
+ "11": {
+  "mult_probe": 0.97,
+  "delta_score": -0.00142,
+  "sigma": 0.1225,
+  "k_star": 1.0387,
+  "gain_vs_ref": 0.00067
+ }
+}

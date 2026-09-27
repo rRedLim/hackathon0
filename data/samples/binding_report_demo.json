@@ -1,0 +1,141 @@
+{
+ "params": {
+  "validations": "test_tail_h.csv",
+  "schedule": "tram_reference.xlsx",
+  "schedule_rows": 15,
+  "tolerance_min": 3.0,
+  "slack_min": 0.5,
+  "min_bound": 1000,
+  "min_stop_share": 0.8,
+  "schedule_grafics": {
+   "1": [
+    "206"
+   ]
+  }
+ },
+ "rows_total": 400000,
+ "not_boarding": 28080,
+ "boardings": 371920,
+ "by_status": {
+  "bound": 0,
+  "no_schedule_for_route": 350699,
+  "no_schedule_for_grafic": 21221,
+  "outside_trips": 0,
+  "bad_record": 0
+ },
+ "share_bound": 0.0,
+ "vehicle_check": {},
+ "by_route": {
+  "1": {
+   "boardings": 21221,
+   "bound": 0,
+   "share_bound": 0.0,
+   "no_schedule_for_route": 0,
+   "no_schedule_for_grafic": 21221,
+   "outside_trips": 0,
+   "bad_record": 0
+  },
+  "7": {
+   "boardings": 52456,
+   "bound": 0,
+   "share_bound": 0.0,
+   "no_schedule_for_route": 52456,
+   "no_schedule_for_grafic": 0,
+   "outside_trips": 0,
+   "bad_record": 0
+  },
+  "11": {
+   "boardings": 69740,
+   "bound": 0,
+   "share_bound": 0.0,
+   "no_schedule_for_route": 69740,
+   "no_schedule_for_grafic": 0,
+   "outside_trips": 0,
+   "bad_record": 0
+  },
+  "12": {
+   "boardings": 72243,
+   "bound": 0,
+   "share_bound": 0.0,
+   "no_schedule_for_route": 72243,
+   "no_schedule_for_grafic": 0,
+   "outside_trips": 0,
+   "bad_record": 0
+  },
+  "17": {
+   "boardings": 55526,
+   "bound": 0,
+   "share_bound": 0.0,
+   "no_schedule_for_route": 55526,
+   "no_schedule_for_grafic": 0,
+   "outside_trips": 0,
+   "bad_record": 0
+  },
+  "25": {
+   "boardings": 8348,
+   "bound": 0,
+   "share_bound": 0.0,
+   "no_schedule_for_route": 8348,
+   "no_schedule_for_grafic": 0,
+   "outside_trips": 0,
+   "bad_record": 0
+  },
+  "26": {
+   "boardings": 19827,
+   "bound": 0,
+   "share_bound": 0.0,
+   "no_schedule_for_route": 19827,
+   "no_schedule_for_grafic": 0,
+   "outside_trips": 0,
+   "bad_record": 0
+  },
+  "28": {
+   "boardings": 21297,
+   "bound": 0,
+   "share_bound": 0.0,
+   "no_schedule_for_route": 21297,
+   "no_schedule_for_grafic": 0,
+   "outside_trips": 0,
+   "bad_record": 0
+  },
+  "50": {
+   "boardings": 51262,
+   "bound": 0,
+   "share_bound": 0.0,
+   "no_schedule_for_route": 51262,
+   "no_schedule_for_grafic": 0,
+   "outside_trips": 0,
+   "bad_record": 0
+  }
+ },
+ "weights_coverage": {
+  "1": {
+   "bound": 0,
+   "bound_on_service_stops": 0,
+   "stops": 42,
+   "stops_observed_share": 0.0,
+   "weights_written": false
+  },
+  "7": {
+   "bound": 0,
+   "bound_on_service_stops": 0,
+   "stops": 87,
+   "stops_observed_share": 0.0,
+   "weights_written": false
+  },
+  "11": {
+   "bound": 0,
+   "bound_on_service_stops": 0,
+   "stops": 83,
+   "stops_observed_share": 0.0,
+   "weights_written": false
+  },
+  "12": {
+   "bound": 0,
+   "bound_on_service_stops": 0,
+   "stops": 95,
+   "stops_observed_share": 0.0,
+   "weights_written": false
+  }
+ }
+}
